@@ -1,0 +1,7 @@
+# Optional: Install langchain-ollama separately if you need it
+# This package may have version conflicts, so install it separately:
+# pip install langchain-ollama --no-deps
+# Then manually install compatible langchain-core version
+
+# Or use the ollama package directly (already in main requirements.txt)
+

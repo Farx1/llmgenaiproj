@@ -1,0 +1,4 @@
+---
+alwaysApply: true
+---
+ALWAYS USE context7 mcp commands to check for documentation before every answer, never assume or use libraries without using context7 as it could create conflicts. (This method will help making sure everything is always up to date too)
