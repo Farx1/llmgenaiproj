@@ -24,12 +24,21 @@ if (-not (Test-Path "node_modules")) {
     }
 }
 
+# Nettoyer le cache si demandé (optionnel)
+# Pour forcer le nettoyage, décommentez les lignes suivantes:
+# if (Test-Path ".next") {
+#     Write-Host "Nettoyage du cache .next..." -ForegroundColor Yellow
+#     Remove-Item -Recurse -Force .next -ErrorAction SilentlyContinue
+# }
+
 # Demarrer le serveur de developpement
 Write-Host ""
 Write-Host "Demarrage du serveur Next.js..." -ForegroundColor Yellow
 Write-Host "Le frontend sera accessible sur http://localhost:3000" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "Appuyez sur Ctrl+C pour arreter le serveur" -ForegroundColor Yellow
+Write-Host ""
+Write-Host "Si vous rencontrez des erreurs de chunk, executez: .\fix_nextjs_cache.ps1" -ForegroundColor Yellow
 Write-Host ""
 
 npm run dev

@@ -1,0 +1,12 @@
+# ESILV URLs to scrape
+# One URL per line. Lines starting with # are ignored.
+# You can use full URLs or relative paths (relative to https://www.esilv.fr)
+
+https://www.esilv.fr
+https://www.esilv.fr/formations
+https://www.esilv.fr/admissions
+https://www.esilv.fr/ecole
+https://www.esilv.fr/actualites
+
+# Add more URLs below...
+

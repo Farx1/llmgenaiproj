@@ -43,50 +43,170 @@ export default function ChatInterface({ selectedModel, availableModels = [] }: C
     setInput('')
     setIsLoading(true)
 
-    try {
-      const response = await axios.post(
-        `${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'}/api/chat/`,
-        {
-          message: userMessage.content,
-          conversation_history: messages.map(m => ({
-            role: m.role,
-            content: m.content
-          })),
-          model: selectedModel
-        },
-        {
-          timeout: 60000, // 60 seconds timeout for LLM responses
-        }
-      )
+    // Create assistant message placeholder for streaming
+    const assistantMessageId = Date.now()
+    const assistantMessage: Message = {
+      role: 'assistant',
+      content: '',
+      timestamp: new Date()
+    }
+    setMessages(prev => [...prev, assistantMessage])
 
-      const assistantMessage: Message = {
-        role: 'assistant',
-        content: response.data.answer,
-        timestamp: new Date()
+    try {
+      const apiUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
+      
+      // Try streaming endpoint first for better UX
+      let useStreaming = true
+      let response: Response
+      
+      try {
+        console.log('🚀 Sending streaming request to:', `${apiUrl}/api/chat/stream`)
+        console.log('📝 Message:', userMessage.content.substring(0, 100))
+        console.log('🤖 Model:', selectedModel)
+        
+        response = await fetch(`${apiUrl}/api/chat/stream`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            message: userMessage.content,
+            conversation_history: messages.map(m => ({
+              role: m.role,
+              content: m.content
+            })),
+            model: selectedModel
+          }),
+          signal: AbortSignal.timeout(120000), // 120 seconds timeout for streaming
+        })
+        
+        console.log('✅ Streaming response received, status:', response.status)
+
+        if (!response.ok) {
+          if (response.status === 404) {
+            // Streaming not available, fallback to non-streaming
+            useStreaming = false
+          } else {
+            throw new Error(`HTTP error! status: ${response.status}`)
+          }
+        }
+      } catch (streamError: any) {
+        // If streaming fails, fallback to non-streaming
+        console.warn('Streaming not available, using fallback:', streamError)
+        useStreaming = false
       }
 
-      setMessages(prev => [...prev, assistantMessage])
+      if (useStreaming && response!.ok) {
+        // Handle streaming response
+        const reader = response!.body?.getReader()
+        const decoder = new TextDecoder()
+        let buffer = ''
+
+        if (!reader) {
+          throw new Error('No response body reader available')
+        }
+
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+
+          buffer += decoder.decode(value, { stream: true })
+          const lines = buffer.split('\n')
+          buffer = lines.pop() || '' // Keep incomplete line in buffer
+
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              try {
+                const data = JSON.parse(line.slice(6))
+                
+                if (data.type === 'chunk') {
+                  // Append chunk to assistant message
+                  setMessages(prev => {
+                    const newMessages = [...prev]
+                    const lastMsg = newMessages[newMessages.length - 1]
+                    if (lastMsg.role === 'assistant') {
+                      lastMsg.content += data.content || ''
+                    }
+                    return newMessages
+                  })
+                } else if (data.type === 'done') {
+                  setIsLoading(false)
+                  return
+                } else if (data.type === 'error') {
+                  throw new Error(data.error || 'Unknown streaming error')
+                }
+              } catch (parseError) {
+                console.warn('Failed to parse SSE data:', line, parseError)
+              }
+            }
+          }
+        }
+        setIsLoading(false)
+      } else {
+        // Fallback to non-streaming endpoint
+        const fallbackResponse = await fetch(`${apiUrl}/api/chat/`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            message: userMessage.content,
+            conversation_history: messages.map(m => ({
+              role: m.role,
+              content: m.content
+            })),
+            model: selectedModel
+          }),
+          signal: AbortSignal.timeout(60000), // 60 seconds timeout
+        })
+
+        if (!fallbackResponse.ok) {
+          throw new Error(`HTTP error! status: ${fallbackResponse.status}`)
+        }
+
+        const data = await fallbackResponse.json()
+        
+        // Update the last message (assistant message) with the full response
+        setMessages(prev => {
+          const newMessages = [...prev]
+          const lastMsg = newMessages[newMessages.length - 1]
+          if (lastMsg.role === 'assistant') {
+            lastMsg.content = data.answer || 'No answer received'
+          }
+          return newMessages
+        })
+        
+        setIsLoading(false)
+      }
     } catch (error: any) {
       console.error('Error sending message:', error)
       
       let errorText = 'Sorry, I encountered an error. Please try again.'
       
-      if (error.code === 'ECONNREFUSED' || error.message?.includes('Network Error') || error.message?.includes('Failed to fetch')) {
+      if (error.message?.includes('Failed to fetch') || error.message?.includes('Network')) {
         errorText = '❌ Cannot connect to the backend server. Please make sure the backend is running on http://localhost:8000'
-      } else if (error.response?.status === 500) {
-        errorText = `Server error: ${error.response?.data?.detail || 'Internal server error'}. Please check the backend logs.`
-      } else if (error.response?.status === 404) {
-        errorText = 'API endpoint not found. Please check the backend configuration.'
-      } else if (error.response?.data?.detail) {
-        errorText = `Error: ${error.response.data.detail}`
+      } else if (error.message?.includes('HTTP error')) {
+        errorText = `Server error: ${error.message}. Please check the backend logs.`
+      } else {
+        errorText = `Error: ${error.message || 'Unknown error'}`
       }
       
-      const errorMessage: Message = {
-        role: 'assistant',
-        content: errorText,
-        timestamp: new Date()
-      }
-      setMessages(prev => [...prev, errorMessage])
+      // Update the last message (assistant message) with error
+      setMessages(prev => {
+        const newMessages = [...prev]
+        const lastMsg = newMessages[newMessages.length - 1]
+        if (lastMsg.role === 'assistant' && lastMsg.content === '') {
+          lastMsg.content = errorText
+        } else {
+          // If streaming already started, append error
+          newMessages.push({
+            role: 'assistant',
+            content: errorText,
+            timestamp: new Date()
+          })
+        }
+        return newMessages
+      })
     } finally {
       setIsLoading(false)
       inputRef.current?.focus()
@@ -133,7 +253,45 @@ export default function ChatInterface({ selectedModel, availableModels = [] }: C
                   : 'bg-gray-100 text-gray-900'
               }`}
             >
-              <p className="whitespace-pre-wrap break-words text-base leading-relaxed font-normal">{message.content}</p>
+              <div className="whitespace-pre-wrap break-words text-base leading-relaxed font-normal">
+                {message.content.split('\n').map((line, lineIdx) => {
+                  // Check if line contains markdown image link: [![alt](img_url)](img_url)
+                  const imageLinkMatch = line.match(/\[!\[([^\]]*)\]\(([^)]+)\)\]\(([^)]+)\)/);
+                  if (imageLinkMatch) {
+                    const [, alt, imgUrl, linkUrl] = imageLinkMatch;
+                    return (
+                      <div key={lineIdx} className="my-2">
+                        <a 
+                          href={linkUrl} 
+                          target="_blank" 
+                          rel="noopener noreferrer"
+                          className="block hover:opacity-90 transition-opacity"
+                        >
+                          <img 
+                            src={imgUrl} 
+                            alt={alt || 'Image'} 
+                            className="max-w-full h-auto rounded-lg shadow-md border border-gray-200"
+                            onError={(e) => {
+                              // Hide image if it fails to load
+                              e.currentTarget.style.display = 'none';
+                            }}
+                          />
+                        </a>
+                        <a 
+                          href={linkUrl} 
+                          target="_blank" 
+                          rel="noopener noreferrer"
+                          className="text-xs text-blue-600 hover:text-blue-800 mt-1 block"
+                        >
+                          🔗 Ouvrir l'image
+                        </a>
+                      </div>
+                    );
+                  }
+                  // Regular text line
+                  return <p key={lineIdx}>{line}</p>;
+                })}
+              </div>
               {message.timestamp && (
                 <p className={`text-xs mt-1 ${
                   message.role === 'user' ? 'text-primary-100' : 'text-gray-500'

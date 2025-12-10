@@ -1,4 +1,6 @@
 """Orchestration agent that coordinates multiple specialized agents."""
+import asyncio
+import logging
 try:
     from langchain.agents import create_agent
 except ImportError:
@@ -9,12 +11,17 @@ except ImportError:
         create_agent = None
         create_tool_calling_agent = None
 
-from langchain.prompts import ChatPromptTemplate
+try:
+    from langchain_core.prompts import ChatPromptTemplate
+except ImportError:
+    from langchain.prompts import ChatPromptTemplate
 from typing import Dict, Any
 from utils.llm_factory import get_llm
 from agents.retrieval_agent import RetrievalAgent
 from agents.web_scraper_agent import WebScraperAgent
 from agents.form_agent import FormAgent
+
+logger = logging.getLogger(__name__)
 
 
 class OrchestratorAgent:
@@ -46,22 +53,7 @@ class OrchestratorAgent:
     
     def _get_system_prompt(self) -> str:
         """Get the system prompt for the orchestrator."""
-        return """You are the ESILV Smart Assistant orchestrator. Your role is to coordinate multiple specialized agents to answer user queries.
-
-Available agents:
-1. **retrieval_agent**: Use this for questions about ESILV programs, admissions, courses, and documentation. This agent searches through vectorized documentation.
-2. **web_scraper_agent**: Use this to get the latest news and updates from the ESILV website.
-3. **form_agent**: Use this when users want to provide contact information, register, or request follow-up.
-
-Your workflow:
-- Analyze the user's query to determine which agent(s) to use
-- If the query is about documentation/programs/admissions → use retrieval_agent
-- If the query is about news/updates → use web_scraper_agent
-- If the user wants to provide contact info → use form_agent
-- You can use multiple agents if needed
-- Always provide clear, helpful responses based on the agent results
-
-Be conversational, helpful, and accurate. If you're unsure, use the retrieval_agent first as it has the most comprehensive information."""
+        return """Assistant ESILV. Coordonne les agents pour répondre aux questions sur les programmes, admissions et informations ESILV. Utilise retrieval_agent pour la documentation, web_scraper_agent pour les actualités, form_agent pour les contacts. Réponds en français."""
     
     def _create_simple_agent(self):
         """Create a simple agent wrapper when create_agent is not available."""
@@ -128,11 +120,21 @@ Be conversational, helpful, and accurate. If you're unsure, use the retrieval_ag
         Returns:
             Response dictionary with answer and metadata
         """
+        import time
+        start_time = time.time()
+        
+        logger.info("=" * 70)
+        logger.info("DEBUG: ========== ORCHESTRATOR.process_query() ==========")
+        logger.info(f"DEBUG: Query: {query[:100]}")
+        logger.info(f"DEBUG: History length: {len(conversation_history) if conversation_history else 0}")
+        logger.info("=" * 70)
+        
         messages = conversation_history or []
         messages.append({"role": "user", "content": query})
         
         try:
             # Convert conversation history to input format
+            logger.info("DEBUG: Converting conversation history...")
             input_text = query
             if conversation_history:
                 # Build context from history
@@ -143,14 +145,21 @@ Be conversational, helpful, and accurate. If you're unsure, use the retrieval_ag
                 if history_text:
                     input_text = f"{history_text}\nuser: {query}"
             
+            logger.info("DEBUG: Invoking agent...")
+            agent_start = time.time()
             # Invoke agent with proper format
             response = await self.agent.ainvoke({"input": input_text})
+            agent_time = time.time() - agent_start
+            logger.info(f"DEBUG: ✅ Agent invoked in {agent_time:.2f}s")
+            logger.info(f"DEBUG: Response type: {type(response)}")
             
             # Extract answer from response
+            logger.info("DEBUG: Extracting answer from response...")
             answer = ""
             if isinstance(response, dict):
                 # AgentExecutor returns {"output": "..."}
                 answer = response.get("output", "")
+                logger.info(f"DEBUG: Got answer from 'output' key: {len(answer)} chars")
                 if not answer:
                     # Fallback: try to get from messages if present
                     messages_list = response.get("messages", [])
@@ -160,11 +169,20 @@ Be conversational, helpful, and accurate. If you're unsure, use the retrieval_ag
                             answer = last_msg.get("content", "")
                         else:
                             answer = str(last_msg)
+                        logger.info(f"DEBUG: Got answer from messages: {len(answer)} chars")
             else:
                 answer = str(response)
+                logger.info(f"DEBUG: Got answer from string conversion: {len(answer)} chars")
             
             if not answer:
+                logger.warning("DEBUG: ⚠️ Empty answer, using default message")
                 answer = "I received an empty response. Please try again."
+            
+            total_time = time.time() - start_time
+            logger.info("=" * 70)
+            logger.info(f"DEBUG: ✅ ORCHESTRATOR.process_query() COMPLETED in {total_time:.2f}s")
+            logger.info(f"DEBUG: Answer length: {len(answer)} chars")
+            logger.info("=" * 70)
             
             return {
                 "answer": answer,
@@ -176,7 +194,14 @@ Be conversational, helpful, and accurate. If you're unsure, use the retrieval_ag
             }
         except Exception as e:
             import traceback
+            total_time = time.time() - start_time
             error_details = traceback.format_exc()
+            logger.error("=" * 70)
+            logger.error(f"DEBUG: ❌❌❌ ERROR in ORCHESTRATOR.process_query() after {total_time:.2f}s")
+            logger.error(f"DEBUG: Error: {str(e)}")
+            logger.error(f"DEBUG: Error type: {type(e)}")
+            logger.error(f"DEBUG: Full traceback:\n{error_details}")
+            logger.error("=" * 70)
             return {
                 "answer": f"I encountered an error processing your query: {str(e)}",
                 "metadata": {
@@ -185,4 +210,126 @@ Be conversational, helpful, and accurate. If you're unsure, use the retrieval_ag
                     "traceback": error_details
                 }
             }
+    
+    async def process_query_stream(
+        self,
+        query: str,
+        conversation_history: list = None
+    ):
+        """
+        Process a user query with streaming response for better memory efficiency.
+        
+        Args:
+            query: User's query
+            conversation_history: Previous conversation messages
+        
+        Yields:
+            Chunks of the response as they are generated
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        messages = conversation_history or []
+        messages.append({"role": "user", "content": query})
+        
+        try:
+            # Determine which agent to use
+            query_lower = query.lower()
+            
+            # Route to appropriate agent and stream response
+            if any(word in query_lower for word in ["contact", "register", "sign up", "email", "phone", "follow-up"]):
+                logger.info("Streaming: Routing to form_agent")
+                form_result = await self.form_agent.process_query(query)
+                answer = form_result.get("answer", "")
+                # Stream in chunks
+                chunk_size = 50
+                for i in range(0, len(answer), chunk_size):
+                    yield {"type": "chunk", "content": answer[i:i + chunk_size]}
+            elif any(word in query_lower for word in ["news", "update", "latest", "recent", "event"]):
+                logger.info("Streaming: Routing to web_scraper_agent")
+                scraper_result = await self.web_scraper_agent.process_query(query)
+                answer = scraper_result.get("answer", "")
+                chunk_size = 50
+                for i in range(0, len(answer), chunk_size):
+                    yield {"type": "chunk", "content": answer[i:i + chunk_size]}
+            else:
+                # Use retrieval agent by default - this can use streaming LLM
+                logger.info("Streaming: Routing to retrieval_agent (default)")
+                
+                # Use streaming LLM if available
+                from langchain_core.messages import HumanMessage, SystemMessage
+                
+                # Get context from retrieval agent (synchronous call for speed)
+                # The retrieval agent now handles k dynamically based on query type
+                # No need to override k here - let the agent decide
+                tool_result = self.retrieval_agent.tool.invoke(query)
+                
+                # Build prompt following LangChain RAG best practices - ULTRA STRICT format
+                if tool_result and "Aucune documentation" not in tool_result and "collection est vide" not in tool_result:
+                    # Check if user wants detailed answer
+                    query_lower = query.lower()
+                    wants_details = any(word in query_lower for word in [
+                        "détails", "détail", "explique", "expliquer", "développe", "développer",
+                        "plus d'infos", "plus d'informations", "en détail", "en profondeur",
+                        "complètement", "complet", "tout", "tous", "liste", "lister"
+                    ])
+                    
+                    # Ultra-minimal prompt for better output quality
+                    prompt = f"""Assistant ESILV - Réponds aux questions sur les programmes, admissions et informations ESILV.
+
+Contexte:
+{tool_result}
+
+Question: {query}
+
+Réponds en français en utilisant uniquement le contexte ci-dessus. Si l'information n'est pas dans le contexte, dis: "Information non trouvée dans la documentation ESILV."
+
+Réponse:"""
+                else:
+                    prompt = f"""Assistant ESILV.
+
+Question: {query}
+
+Aucune information trouvée dans la documentation. Réponds en français avec tes connaissances générales sur ESILV.
+
+Réponse:"""
+                
+                # Generate response (no streaming for simplicity)
+                yield {"type": "metadata", "data": {"agent": "retrieval", "model": getattr(self.llm, 'model', 'unknown')}}
+                
+                try:
+                    # Log the context to verify it's being passed
+                    logger.info(f"DEBUG: Context length: {len(tool_result) if tool_result else 0}")
+                    logger.info(f"DEBUG: Context preview (first 500 chars): {tool_result[:500] if tool_result else 'None'}")
+                    
+                    # Put EVERYTHING in a single HumanMessage to force the model to read it
+                    # Some models ignore SystemMessage, so we put everything in the user message
+                    full_prompt = prompt  # prompt already contains context + question
+                    messages = [HumanMessage(content=full_prompt)]
+                    
+                    logger.info(f"DEBUG: Sending {len(messages)} messages to LLM")
+                    logger.info(f"DEBUG: First message length: {len(full_prompt)}")
+                    
+                    result = await self.llm.ainvoke(messages)
+                    answer = result.content if hasattr(result, 'content') else str(result)
+                    
+                    logger.info(f"DEBUG: Received answer length: {len(answer)}")
+                    logger.info(f"DEBUG: Answer preview (first 200 chars): {answer[:200]}")
+                    
+                    # Stream the complete answer in chunks for frontend compatibility
+                    chunk_size = 50
+                    for i in range(0, len(answer), chunk_size):
+                        yield {"type": "chunk", "content": answer[i:i + chunk_size]}
+                        await asyncio.sleep(0.01)  # Small delay for smooth streaming
+                except Exception as gen_error:
+                    logger.error(f"Error in generation: {gen_error}")
+                    yield {"type": "error", "error": f"Erreur lors de la generation: {str(gen_error)}"}
+            
+            yield {"type": "done"}
+            
+        except Exception as e:
+            import traceback
+            logger.error(f"Error in streaming query: {str(e)}")
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            yield {"type": "error", "error": f"I encountered an error processing your query: {str(e)}"}
 

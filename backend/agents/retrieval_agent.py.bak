@@ -24,16 +24,11 @@ class RetrievalAgent:
     
     def __init__(self, model_name: str = None):
         """
-        Initialize the retrieval agent with model-aware context management.
+        Initialize the retrieval agent.
         
         Args:
             model_name: Name of the model to use
         """
-        from utils.llm_factory import get_model_context_window
-        self.model_name = model_name
-        self.context_window = get_model_context_window(model_name or "llama3")
-        logger.info(f"RetrievalAgent initialized with model '{model_name or 'default'}' - Context window: {self.context_window:,} tokens")
-        
         self.llm = get_llm(model_name=model_name)
         self.vector_store = vector_store
         self.tool = self._create_retrieval_tool()
@@ -77,69 +72,32 @@ class RetrievalAgent:
                     "complètement", "complet", "tout", "tous", "liste", "lister"
                 ])
                 
-                # Enhanced k for better retrieval - increase for specific queries
-                # Use larger k initially, then rerank to top results
+                # Optimized k for better context without overwhelming the model
+                # Keep k reasonable to avoid token limit issues (Llama3 has ~8k token limit)
                 if any(word in query_lower for word in ["majeure", "majeures", "major", "majors", "spécialisation", "spécialisations"]):
-                    k_value = 12  # Increased for comprehensive list
-                elif any(word in query_lower for word in ["parcours", "quantique", "quantum"]):
-                    k_value = 15  # Significantly increased for specific program queries
-                elif any(word in query_lower for word in ["programme", "formation", "cours"]):
-                    k_value = 10
+                    k_value = 8  # Reduced from 20 - enough for comprehensive list
+                elif any(word in query_lower for word in ["parcours", "quantique", "quantum", "programme", "formation"]):
+                    k_value = 6  # Reduced from 18 - enough for detailed answer
                 else:
-                    k_value = 8  # Increased for general queries
+                    k_value = 5  # Reduced from 15 - enough for general queries
                 
-                # Try hybrid search: vector similarity + keyword search
-                # First, get vector similarity results
                 docs = vector_store_ref.similarity_search(query, k=k_value)
                 logger.info(f"DEBUG: ✅ Vector search returned {len(docs)} documents (k={k_value})")
-                
-                # Also try keyword-based search for exact matches (especially for "quantique")
-                query_keywords = [w for w in query_lower.split() if len(w) > 3]
-                keyword_docs = []
-                if query_keywords:
-                    try:
-                        # Try to get more results with keyword boost
-                        # Search with expanded k to catch keyword matches
-                        expanded_docs = vector_store_ref.similarity_search(query, k=min(k_value * 2, 20))
-                        
-                        # Filter for keyword matches
-                        for doc in expanded_docs:
-                            content = (doc.page_content.lower() if hasattr(doc, 'page_content') else str(doc).lower())
-                            metadata = getattr(doc, 'metadata', {}) if hasattr(doc, 'metadata') else {}
-                            title = str(metadata.get("title", "")).lower()
-                            url = str(metadata.get("url", metadata.get("source", ""))).lower()
-                            
-                            # Check if any keyword appears in content/title/url
-                            for keyword in query_keywords:
-                                if keyword in content or keyword in title or keyword in url:
-                                    # Avoid duplicates
-                                    if doc not in docs and doc not in keyword_docs:
-                                        keyword_docs.append(doc)
-                                        break
-                        
-                        # Merge keyword results with vector results (prioritize keyword matches)
-                        if keyword_docs:
-                            logger.info(f"DEBUG: ✅ Found {len(keyword_docs)} additional documents via keyword search")
-                            # Prepend keyword matches for higher priority
-                            docs = keyword_docs + [d for d in docs if d not in keyword_docs]
-                    except Exception as keyword_error:
-                        logger.warning(f"DEBUG: Keyword search failed: {keyword_error}")
-                
-                logger.info(f"DEBUG: ✅ Total documents after hybrid search: {len(docs)}")
                 
                 # Log first few results to verify they're relevant
                 if docs:
                     logger.info(f"DEBUG: First result preview: {docs[0].page_content[:200] if hasattr(docs[0], 'page_content') else str(docs[0])[:200]}")
                     logger.info(f"DEBUG: First result metadata: {docs[0].metadata if hasattr(docs[0], 'metadata') else 'No metadata'}")
                 
-                # Enhanced reranking: score documents based on multiple factors
+                # Rerank and filter results to prioritize relevant documents
+                # Score documents based on keyword matches in title/url
                 query_lower = query.lower()
                 query_keywords = [w for w in query_lower.split() if len(w) > 2]
                 
-                # Score each document based on relevance (improved scoring)
+                # Score each document based on relevance
                 scored_docs = []
-                for idx, doc in enumerate(docs):
-                    score = 0.0
+                for doc in docs:
+                    score = 0
                     metadata = getattr(doc, 'metadata', {}) if hasattr(doc, 'metadata') else {}
                     if isinstance(doc, dict):
                         metadata = doc.get('metadata', {})
@@ -147,56 +105,22 @@ class RetrievalAgent:
                     title = str(metadata.get("title", "")).lower()
                     url = str(metadata.get("url", metadata.get("source", ""))).lower()
                     content = doc.page_content.lower() if hasattr(doc, 'page_content') else str(doc).lower()
-                    content_full = content
                     
-                    # Boost for position (earlier results from vector search are generally better)
-                    position_boost = max(0, (len(docs) - idx) / len(docs)) * 2
-                    score += position_boost
-                    
-                    # High score for exact phrase matches
-                    query_phrase = query_lower.strip()
-                    if query_phrase in title:
-                        score += 50  # Very high priority for exact phrase in title
-                    if query_phrase in content[:500]:
-                        score += 30  # High priority for exact phrase in content
-                    
-                    # Score for keyword matches in title/url (higher weight)
+                    # High score for exact matches in title/url
                     for keyword in query_keywords:
                         if keyword in title:
-                            score += 20  # Very high priority for title matches
+                            score += 10  # High priority for title matches
                         if keyword in url:
-                            score += 15  # High priority for URL matches
-                        # Count keyword occurrences in content
-                        keyword_count = content.count(keyword)
-                        score += min(keyword_count * 2, 10)  # Cap at 10 per keyword
+                            score += 8   # High priority for URL matches
+                        if keyword in content[:200]:  # First 200 chars
+                            score += 3
                     
-                    # Extra boost for important terms (especially "quantique")
-                    important_terms = {
-                        "quantique": 30,  # Very high priority
-                        "quantum": 30,
-                        "parcours": 20,
-                        "majeure": 15,
-                        "programme": 10,
-                        "formation": 10
-                    }
-                    for term, term_score in important_terms.items():
+                    # Extra boost for important terms
+                    important_terms = ["quantique", "quantum", "parcours", "majeure"]
+                    for term in important_terms:
                         if term in query_lower:
-                            if term in title:
-                                score += term_score
-                            elif term in url:
-                                score += term_score * 0.8
-                            elif term in content:
-                                score += term_score * 0.5
-                    
-                    # Bonus for documents with "quantique" + "parcours" together
-                    if "quantique" in query_lower and "parcours" in query_lower:
-                        if "quantique" in content and "parcours" in content:
-                            score += 25  # Very high bonus for both terms
-                    
-                    # Penalty for very short content (likely incomplete chunks)
-                    content_length = len(content)
-                    if content_length < 50:
-                        score -= 5
+                            if term in title or term in url:
+                                score += 15  # Very high priority
                     
                     scored_docs.append((score, doc))
                 
@@ -204,41 +128,10 @@ class RetrievalAgent:
                 scored_docs.sort(key=lambda x: x[0], reverse=True)
                 docs = [doc for score, doc in scored_docs]
                 
-                # Log top scores for debugging
-                if scored_docs:
-                    logger.info(f"DEBUG: Top 3 scores: {[f'{s:.1f}' for s, _ in scored_docs[:3]]}")
-                
-                # Adaptive max_docs based on model context window
-                # Calculate how many documents we can fit in the available context
-                from utils.llm_factory import estimate_tokens
-                
-                # Reserve tokens for prompt, query, and response
-                reserved_tokens = 2000
-                available_context = max(0, self.context_window - reserved_tokens)
-                
-                # Estimate average chunk size (conservative: 600 chars per chunk = ~150 tokens)
-                avg_chunk_tokens = 150
-                
-                # Calculate max documents we can fit
-                max_docs_by_context = available_context // avg_chunk_tokens
-                
-                # Base max_docs by query type
-                if any(word in query_lower for word in ["quantique", "quantum", "parcours"]):
-                    base_max = 8 if wants_details else 5
-                else:
-                    base_max = 6 if wants_details else 4
-                
-                # Use the minimum of base_max and context-based limit
-                max_docs = min(base_max, max_docs_by_context, len(docs))
-                
-                # For very large context windows, allow more documents
-                if self.context_window >= 1_000_000:  # Qwen3, InternLM2.5
-                    max_docs = min(max_docs * 2, 20, len(docs))
-                elif self.context_window >= 100_000:  # Llama 3.1, DeepSeek
-                    max_docs = min(int(max_docs * 1.5), 15, len(docs))
-                
+                # Limit to top results after reranking (prioritize highest scores)
+                # Take top 6-8 documents max to avoid overwhelming the model
+                max_docs = 6 if wants_details else 4  # 4 for brief, 6 for detailed
                 docs = docs[:max_docs]
-                logger.info(f"DEBUG: Selected {max_docs} documents (max by context: {max_docs_by_context})")
                 
                 logger.info(f"DEBUG: ✅ After reranking: {len(docs)} documents (top {max_docs} by relevance)")
                 if docs:
@@ -342,11 +235,10 @@ class RetrievalAgent:
                                 else:
                                     content_truncated = content_truncated[:600] + '...'
                             
-                            # Simple format inspired by NED project: Source, Title, Content
-                            block = f"""Source: {url}
-Titre: {title[:60]}
-Contenu:
-{content_truncated}"""
+                            # Compact format: title and essential content only
+                            block = f"""[{title[:60]}]
+{content_truncated}
+"""
                             context_blocks.append(block.strip())
                     except Exception as doc_error:
                         logger.warning(f"Error processing document {idx}: {str(doc_error)}")
@@ -356,51 +248,36 @@ Contenu:
                     return "Aucune documentation pertinente trouvée dans la base de connaissances. Vous pouvez utiliser vos connaissances générales pour répondre à la question."
                 
                 # Simple join - no fancy headers to save tokens
+                # Hard limit: truncate context to 8000 chars max to avoid token limit
                 formatted_context = "\n\n".join(context_blocks)
                 
-                # Adaptive context truncation based on model context window
-                from utils.llm_factory import estimate_tokens
-                
-                # Reserve tokens for: system prompt (~200), user query (~100), response (~1000), safety margin (~500)
-                reserved_tokens = 1800
-                max_context_tokens = max(0, self.context_window - reserved_tokens)
-                
-                # Estimate tokens in formatted context
-                context_tokens = estimate_tokens(formatted_context)
-                
-                # If context exceeds available tokens, truncate intelligently
-                if context_tokens > max_context_tokens:
-                    # Calculate how many characters we can keep
-                    # Use a conservative estimate: 1 token = 4 characters
-                    max_context_chars = max_context_tokens * 4
-                    
-                    logger.warning(f"DEBUG: Context too large ({context_tokens:,} tokens, limit: {max_context_tokens:,}), truncating to {max_context_chars:,} chars")
-                    
-                    # Truncate but try to keep complete blocks
-                    truncated = ""
-                    current_tokens = 0
-                    for block in context_blocks:
-                        block_tokens = estimate_tokens(block)
-                        if current_tokens + block_tokens <= max_context_tokens:
-                            truncated += block + "\n\n"
-                            current_tokens += block_tokens
-                        else:
-                            # Try to fit partial block
-                            remaining_tokens = max_context_tokens - current_tokens
-                            if remaining_tokens > 50:  # Only if significant space left
-                                # Truncate block to fit
-                                remaining_chars = remaining_tokens * 4
-                                truncated += block[:remaining_chars] + "...\n\n"
-                            break
-                    
-                    formatted_context = truncated + "\n\n[Contexte adapté pour respecter les limites du modèle]"
-                    logger.info(f"DEBUG: Final context: {estimate_tokens(formatted_context):,} tokens")
-                else:
-                    logger.info(f"DEBUG: Context fits within limit: {context_tokens:,}/{max_context_tokens:,} tokens")
+                # Truncate if too long (Llama3 has ~8k token limit)
+                if len(formatted_context) > 8000:
+                    logger.warning(f"DEBUG: Context too long ({len(formatted_context)} chars), truncating to 8000")
+                    truncated = formatted_context[:8000]
+                    last_block_end = truncated.rfind('\n\n[', 0, 8000)
+                    if last_block_end > 6000:
+                        formatted_context = truncated[:last_block_end]
+                    else:
+                        formatted_context = truncated
                 
                 logger.info(f"DEBUG: ✅ Formatted context length: {len(formatted_context)}")
                 logger.info(f"DEBUG: ✅ Context preview (first 500 chars): {formatted_context[:500]}")
                 
+                return formatted_context
+║          {count} document(s) pertinent(s) trouvé(s)        ║
+╚═══════════════════════════════════════════════════════════╝
+
+""".format(count=len(context_blocks))
+                
+                context_footer = """
+
+╔═══════════════════════════════════════════════════════════╗
+║              FIN DE LA DOCUMENTATION ESILV                ║
+╚═══════════════════════════════════════════════════════════╝"""
+                
+                # Join blocks with clear separation
+                formatted_context = context_header + "\n\n".join(context_blocks) + context_footer
                 return formatted_context
             except Exception as e:
                 import traceback
@@ -412,7 +289,14 @@ Contenu:
     
     def _get_system_prompt(self) -> str:
         """Get the system prompt for the retrieval agent."""
-        return """Assistant ESILV. Réponds aux questions sur les programmes, admissions et informations ESILV."""
+        return """Tu es un assistant spécialisé pour l'école d'ingénieurs ESILV. Ton rôle est de répondre aux questions sur:
+- Les programmes academiques et specialisations (majeures)
+- Les conditions d'admission et processus
+- Les descriptions de cours et curriculum
+- Les politiques et procedures de l'ecole
+- Les informations generales sur ESILV
+
+Utilise l'outil search_documentation pour trouver des informations pertinentes dans la documentation vectorisee. Si aucune documentation n'est trouvee, utilise tes connaissances generales pour repondre de maniere utile et precise. Reponds toujours en francais de maniere claire et professionnelle."""
     
     def _create_simple_agent(self):
         """Create a simple agent when create_agent is not available."""
@@ -459,24 +343,56 @@ Contenu:
                             "complètement", "complet", "tout", "tous", "liste", "lister"
                         ])
                         
-                        # Ultra-minimal prompt for better output quality
-                        prompt = f"""Assistant ESILV - Réponds aux questions sur les programmes, admissions et informations ESILV.
+                        # Context found - use ULTRA STRICT RAG prompt with brevity instruction
+                        detail_instruction = "Réponds de manière DÉTAILLÉE et COMPLÈTE en utilisant toutes les informations pertinentes du contexte." if wants_details else "Réponds de manière BRÈVE et CONCISE. Donne seulement l'essentiel (2-3 phrases maximum). Si l'utilisateur veut plus de détails, il le demandera explicitement."
+                        
+                        prompt = f"""Tu es un assistant expert EXCLUSIVEMENT pour l'école d'ingénieurs ESILV.
 
-Contexte:
+⚠️⚠️⚠️ RÈGLE CRITIQUE - À RESPECTER IMPÉRATIVEMENT ⚠️⚠️⚠️
+
+Tu DOIS répondre UNIQUEMENT en utilisant les informations du contexte ci-dessous.
+INTERDICTION TOTALE d'utiliser tes connaissances générales, les questions sont posées sur l'ESILV et ce qui est relié à l'ESILV.
+Si tu utilises des informations qui ne sont PAS dans le contexte, ta réponse sera INCORRECTE.
+
+CONTEXTE DE LA DOCUMENTATION ESILV (utilise UNIQUEMENT ces informations):
 {tool_result}
 
+QUESTION DE L'UTILISATEUR: {user_message}
+
+INSTRUCTIONS STRICTES:
+1. Lis attentivement le contexte ci-dessus
+2. Trouve les informations pertinentes dans le contexte pour répondre à la question
+3. Réponds UNIQUEMENT en utilisant ces informations du contexte
+4. {detail_instruction}
+5. Si l'information n'est pas dans le contexte, dis: "Je ne trouve pas cette information dans la documentation ESILV indexée."
+6. Réponds en français
+7. ❌ INTERDICTION ABSOLUE de répéter des mots/phrases. Si tu commences à répéter, ARRÊTE immédiatement.
+8. Ne répète JAMAIS les phrases ou les mots - chaque mot ne doit apparaître qu'une seule fois
+9. Structure ta réponse clairement
+
+COMMENCE TA RÉPONSE MAINTENANT (utilise UNIQUEMENT le contexte ci-dessus):"""
+                    else:
+                        # No context found or collection is empty
+                        if "collection est vide" in tool_result:
+                            # Collection is empty - tell user to index documents
+                            prompt = f"""{system_prompt}
+
 Question: {user_message}
 
-Réponds en français en utilisant uniquement le contexte ci-dessus. Si l'information n'est pas dans le contexte, dis: "Information non trouvée dans la documentation ESILV."
+⚠️ IMPORTANT: La base de connaissances est vide. Aucune documentation n'a été indexée.
+
+Réponds à la question en utilisant tes connaissances générales, mais informe l'utilisateur que pour des informations précises et à jour, il doit d'abord indexer la documentation ESILV en utilisant le scraping (backend/scrape_esilv.py) ou l'upload de documents via l'interface web.
 
 Réponse:"""
-                    else:
-                        # No context found - minimal prompt
-                        prompt = f"""Assistant ESILV.
+                        else:
+                            # No relevant context found - use general knowledge but be clear
+                            prompt = f"""{system_prompt}
 
 Question: {user_message}
 
-Aucune information trouvée dans la documentation. Réponds en français avec tes connaissances générales sur ESILV.
+Aucune documentation pertinente n'a été trouvée dans la base de connaissances pour cette question spécifique. 
+
+Réponds en utilisant tes connaissances générales, mais sois clair que ces informations peuvent ne pas être à jour ou spécifiques à ESILV. Recommande à l'utilisateur de consulter le site web officiel de l'ESILV pour des informations précises.
 
 Réponse:"""
                     

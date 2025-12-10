@@ -27,6 +27,9 @@ export default function RootLayout({
                 <Link href="/" className="text-gray-700 hover:text-primary-600">
                   Chat
                 </Link>
+                <Link href="/rag" className="text-gray-700 hover:text-primary-600">
+                  RAG
+                </Link>
                 <Link href="/admin" className="text-gray-700 hover:text-primary-600">
                   Admin
                 </Link>
